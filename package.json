@@ -1,0 +1,23 @@
+{
+  "name": "opencode-codex-websearch",
+  "type": "module",
+  "private": true,
+  "main": "src/codex-web-search.ts",
+  "module": "src/codex-web-search.ts",
+  "types": "src/codex-web-search.ts",
+  "exports": {
+    ".": "./src/codex-web-search.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.26"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  }
+}
