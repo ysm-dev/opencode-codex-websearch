@@ -1,20 +1,22 @@
 {
   "name": "opencode-codex-websearch",
-  "version": "0.1.1",
-  "description": "OpenCode plugin for web search using ChatGPT Codex authentication",
+  "version": "0.2.0",
+  "description": "OpenCode v2 websearch provider using ChatGPT Codex authentication",
   "type": "module",
-  "main": "src/codex-web-search.ts",
-  "module": "src/codex-web-search.ts",
-  "types": "src/codex-web-search.ts",
+  "main": "index.ts",
+  "module": "index.ts",
+  "types": "index.ts",
   "exports": {
-    ".": "./src/codex-web-search.ts"
+    ".": "./index.ts"
   },
   "files": [
+    "index.ts",
     "src"
   ],
   "scripts": {
+    "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run typecheck"
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "keywords": [
     "opencode",
@@ -36,7 +38,8 @@
     "access": "public"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.18.26"
+    "@opencode/plugin": "2.0.3",
+    "effect": "4.0.0-rc.112"
   },
   "devDependencies": {
     "@types/bun": "latest",
