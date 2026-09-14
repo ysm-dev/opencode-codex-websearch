@@ -1,11 +1,7 @@
 import { randomUUID } from "node:crypto"
-import { existsSync } from "node:fs"
-import { readFile, realpath } from "node:fs/promises"
-import { homedir } from "node:os"
-import { dirname, join, resolve } from "node:path"
-import { fileURLToPath } from "node:url"
-import type { Plugin } from "@opencode-ai/plugin"
-import { tool } from "@opencode-ai/plugin/tool"
+import { Plugin } from "@opencode/plugin"
+import type { IntegrationDomain } from "@opencode/plugin/promise/integration"
+import { HttpClientError, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 
 const SEARCH_ENDPOINT = "https://chatgpt.com/backend-api/codex/alpha/search"
 const MODELS_ENDPOINT = "https://chatgpt.com/backend-api/codex/models?client_version=0.147.0"
@@ -17,200 +13,153 @@ const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "graphem
 type CodexAuth = {
   accessToken: string
   accountId?: string
+  credentialID: string
   fedramp: boolean
-  uploaded: boolean
 }
 
-type OpenCodeOAuth = {
-  type: "oauth"
-  access: string
-  expires: number
-  accountId?: string
-  fedramp?: boolean
+type SearchOptions = {
+  max_results: number
+  recency?: number
+  domains?: string[]
 }
 
-type SearchResult = {
-  title: string
-  url: string
-  snippet?: string
-}
+export const CodexWebSearchPlugin = Plugin.define({
+  id: "opencode-codex-websearch",
+  async setup(ctx) {
+    const options = parseOptions(ctx.options)
+    const lifetime = new AbortController()
+    let cached: { credentialID: string; accountId?: string; model: string } | undefined
 
-const registeredClients = new WeakSet()
-let codexModel: string | undefined
+    await ctx.websearch.transform((editor) => {
+      editor.add({
+        id: "codex",
+        name: "ChatGPT Codex",
+        async execute({ query }, { signal }) {
+          const q = query.trim()
+          if (!q || q.length > 500) throw new Error("Codex search query must contain 1 to 500 characters")
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
-}
+          return withTimeout(AbortSignal.any([signal, lifetime.signal]), async (signal) => {
+            const auth = await loadCodexAuth(ctx.integration.connection)
+            signal.throwIfAborted()
+            const model =
+              cached?.credentialID === auth.credentialID && cached.accountId === auth.accountId
+                ? cached.model
+                : await discoverCodexModel(auth, signal)
+            signal.throwIfAborted()
+            cached = { credentialID: auth.credentialID, accountId: auth.accountId, model }
 
-function errorCode(error: unknown) {
-  return isRecord(error) && typeof error.code === "string" ? error.code : undefined
-}
-
-function cleanText(value: unknown, maxBytes: number): string | undefined {
-  if (typeof value !== "string") return undefined
-
-  const text = value.replace(/\s+/g, " ").trim()
-  if (!text) return undefined
-  return truncateText(text, maxBytes)
-}
-
-function truncateText(value: string, maxBytes: number) {
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value
-
-  const segments: string[] = []
-  let size = Buffer.byteLength("...", "utf8")
-  for (const item of GRAPHEME_SEGMENTER.segment(value)) {
-    const next = Buffer.byteLength(item.segment, "utf8")
-    if (size + next > maxBytes) break
-    segments.push(item.segment)
-    size += next
-  }
-  return `${segments.join("")}...`
-}
-
-function normalizeUrl(value: unknown): string | undefined {
-  if (typeof value !== "string" || value.length > 2_048) return undefined
-
-  try {
-    const url = new URL(value)
-    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined
-    const normalized = url.toString()
-    return Buffer.byteLength(normalized, "utf8") <= 2_048 ? normalized : undefined
-  } catch {
-    return undefined
-  }
-}
-
-function normalizeResponse(payload: unknown, limit: number) {
-  if (
-    !isRecord(payload) ||
-    typeof payload.output !== "string" ||
-    (payload.results !== undefined && payload.results !== null && !Array.isArray(payload.results))
-  ) {
-    throw new Error("Codex web search returned an invalid response")
-  }
-
-  const results: SearchResult[] = []
-  for (const item of payload.results ?? []) {
-    if (!isRecord(item)) continue
-
-    const url = normalizeUrl(item.url)
-    if (!url) continue
-
-    results.push({
-      title: cleanText(item.title, 300) ?? url,
-      url,
-      snippet: cleanText(item.snippet, 1_000),
+            const searchQuery = {
+              q,
+              ...(options.recency !== undefined ? { recency: options.recency } : {}),
+              ...(options.domains?.length ? { domains: options.domains } : {}),
+            }
+            const payload = await requestJson(
+              SEARCH_ENDPOINT,
+              auth,
+              signal,
+              "Codex web search",
+              {
+                id: `search_session_${randomUUID().replaceAll("-", "").slice(0, 16)}`,
+                model,
+                commands: { search_query: [searchQuery] },
+              },
+            )
+            return normalizeResponse(payload, options.max_results)
+          })
+        },
+      })
     })
-    if (results.length >= limit) break
-  }
 
-  return results
-}
-
-function formatResponse(query: string, results: SearchResult[]): string {
-  const items: string[] = []
-  for (const result of results) {
-    const snippet = result.snippet ? `\n${result.snippet}` : ""
-    const item = `## ${result.title}\n${result.url}${snippet}`
-    if (items.length && Buffer.byteLength([...items, item].join("\n\n"), "utf8") > MAX_OUTPUT_BYTES) break
-    items.push(item)
-  }
-
-  if (items.length === 0) return `No web search results found for: "${query}".`
-  return truncateText(items.join("\n\n"), MAX_OUTPUT_BYTES)
-}
-
-async function loadCodexAuth() {
-  const environment = openCodeAuthEnvironment()
-  const auth = parseOpenCodeOAuth((environment ?? (await loadOpenCodeAuthFile())).openai)
-  if (!auth) {
-    throw new Error("OpenCode ChatGPT authentication is unavailable; run `opencode auth login` and retry")
-  }
-  if (auth.expires <= Date.now() + REQUEST_TIMEOUT_MS) {
-    if (environment) {
-      throw new Error("Uploaded OpenCode ChatGPT authentication has expired; recreate the workspace and retry")
+    return () => {
+      lifetime.abort()
+      cached = undefined
     }
-    throw new Error("OpenCode ChatGPT authentication has expired; run `opencode auth login` and retry")
-  }
-  return codexAuth(auth, environment !== undefined)
-}
+  },
+})
 
-function parseOpenCodeOAuth(auth: unknown): OpenCodeOAuth | undefined {
-  if (!isRecord(auth) || auth.type !== "oauth" || typeof auth.access !== "string" || typeof auth.expires !== "number") {
-    return undefined
+export default CodexWebSearchPlugin
+
+function parseOptions(options: Record<string, unknown>): SearchOptions {
+  for (const key of Object.keys(options)) {
+    if (!["max_results", "recency", "domains"].includes(key)) throw new Error(`Unknown Codex search option: ${key}`)
+  }
+  const integer = (key: string, maximum: number) => {
+    const value = options[key]
+    if (value === undefined) return undefined
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > maximum) {
+      throw new Error(`Codex search option ${key} must be an integer from 1 to ${maximum}`)
+    }
+    return value
+  }
+  const max_results = integer("max_results", 20) ?? DEFAULT_MAX_RESULTS
+  const recency = integer("recency", 3_650)
+  const domains = options.domains
+  if (domains === undefined) return { max_results, recency }
+  if (!Array.isArray(domains) || domains.length > 20) {
+    throw new Error("Codex search option domains must be an array of at most 20 domains")
   }
   return {
-    type: "oauth",
-    access: auth.access,
-    expires: auth.expires,
-    ...(typeof auth.accountId === "string" ? { accountId: auth.accountId } : {}),
-    ...(typeof auth.fedramp === "boolean" ? { fedramp: auth.fedramp } : {}),
+    max_results,
+    recency,
+    domains: domains.map((domain: unknown) => {
+      if (typeof domain !== "string" || !domain.trim() || domain.trim().length > 253) {
+        throw new Error("Each Codex search domain must contain 1 to 253 characters")
+      }
+      return domain.trim()
+    }),
   }
 }
 
-async function loadOpenCodeAuthFile() {
-  const parsed = parseOpenCodeAuth(await readFile(openCodeAuthPath(), "utf8"))
-  if (parsed) return parsed
-  throw new Error("OpenCode authentication data is invalid")
+async function loadCodexAuth(connectionAPI: IntegrationDomain["connection"]): Promise<CodexAuth> {
+  const connection = await connectionAPI.active("openai")
+  const credential = connection ? await connectionAPI.resolve(connection) : undefined
+  if (
+    connection?.type !== "credential" ||
+    credential?.type !== "oauth" ||
+    !["chatgpt-browser", "chatgpt-headless"].includes(credential.methodID) ||
+    !credential.access
+  ) {
+    throw new Error("OpenCode ChatGPT authentication is unavailable; run `opencode auth login` and select ChatGPT")
+  }
+  // OpenCode resolves SQLite credentials and refreshes OAuth before returning them.
+  if (credential.expires <= Date.now() + REQUEST_TIMEOUT_MS) {
+    throw new Error("OpenCode ChatGPT authentication has expired; reconnect ChatGPT with `opencode auth login`")
+  }
+  const claims = tokenAuthClaims(credential.access)
+  return {
+    accessToken: credential.access,
+    credentialID: connection.id,
+    accountId: cleanText(credential.metadata?.accountID, 1_000) ?? claims.accountId,
+    fedramp: typeof credential.metadata?.fedramp === "boolean" ? credential.metadata.fedramp : claims.fedramp,
+  }
 }
 
-function openCodeAuthEnvironment() {
-  const environment = process.env.OPENCODE_AUTH_CONTENT?.trim()
-  return environment ? parseOpenCodeAuth(environment) : undefined
-}
-
-function parseOpenCodeAuth(content: string): Record<string, unknown> | undefined {
+async function withTimeout<T>(parent: AbortSignal, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController()
+  const signal = AbortSignal.any([parent, controller.signal])
+  const timeout = setTimeout(() => {
+    controller.abort(new Error(`Codex web search timed out after ${REQUEST_TIMEOUT_MS}ms`))
+  }, REQUEST_TIMEOUT_MS)
+  let onAbort = () => {}
   try {
-    const parsed: unknown = JSON.parse(content)
-    return isRecord(parsed) ? parsed : undefined
-  } catch {
-    return undefined
-  }
-}
-
-function openCodeAuthPath() {
-  const dataRoot = process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share")
-  return join(dataRoot, "opencode", "auth.json")
-}
-
-function openCodeConfigPaths() {
-  const xdgConfig = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config")
-  const custom = process.env.OPENCODE_CONFIG_DIR?.trim()
-  return [
-    resolve(join(xdgConfig, "opencode")),
-    resolve(join(homedir(), ".opencode")),
-    ...(custom ? [resolve(custom)] : []),
-  ]
-}
-
-function projectConfigPaths(directory: string, worktree: string): string[] {
-  const root = resolve(worktree)
-  const current = resolve(directory)
-  if (current === root) return [resolve(root, ".opencode")]
-  const parent = dirname(current)
-  if (parent === current) return [resolve(current, ".opencode")]
-  return [resolve(current, ".opencode"), ...projectConfigPaths(parent, root)]
-}
-
-function canonicalPath(path: string) {
-  return realpath(path).catch((error: unknown) => {
-    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return resolve(path)
+    signal.throwIfAborted()
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(signal.reason)
+      signal.addEventListener("abort", onAbort, { once: true })
+    })
+    // Integration resolution has no signal parameter; stop waiting if it outlives the request.
+    return await Promise.race([work(signal), aborted])
+  } catch (error) {
+    if (parent.aborted) throw new Error("Codex web search was cancelled", { cause: error })
+    if (controller.signal.aborted) throw controller.signal.reason
     throw error
-  })
-}
-
-function codexAuth(auth: OpenCodeOAuth, uploaded: boolean): CodexAuth {
-  const claims = tokenAuthClaims(auth.access)
-  return {
-    accessToken: auth.access,
-    accountId: cleanText(auth.accountId, 1_000) ?? claims.accountId,
-    fedramp: auth.fedramp ?? claims.fedramp,
-    uploaded,
+  } finally {
+    clearTimeout(timeout)
+    signal.removeEventListener("abort", onAbort)
   }
 }
 
-function authHeaders(auth: CodexAuth) {
+async function requestJson(url: string, auth: CodexAuth, signal: AbortSignal, operation: string, body?: unknown) {
   const headers: Record<string, string> = {
     Accept: "application/json",
     Authorization: `Bearer ${auth.accessToken}`,
@@ -218,48 +167,53 @@ function authHeaders(auth: CodexAuth) {
   }
   if (auth.accountId) headers["ChatGPT-Account-ID"] = auth.accountId
   if (auth.fedramp) headers["X-OpenAI-Fedramp"] = "true"
-  return headers
+  if (body !== undefined) headers["Content-Type"] = "application/json"
+  const method = body === undefined ? "GET" : "POST"
+  const response = await fetch(url, {
+    method,
+    headers,
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    signal,
+  }).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : "unknown network error"
+    throw new Error(`${operation} request failed: ${message}`, { cause: error })
+  })
+  if (!response.ok) {
+    const description = responseError(response, operation)
+    // Native errors preserve status/Retry-After for v2's random-provider cooldown and fallback.
+    // Deliberately omit authorization headers and request bodies from diagnostic objects.
+    const request = HttpClientRequest.make(method)(url)
+    const error = new HttpClientError.HttpClientError({
+      reason: new HttpClientError.StatusCodeError({
+        request,
+        response: HttpClientResponse.fromWeb(request, response),
+        description,
+      }),
+    })
+    await response.body?.cancel()
+    throw error
+  }
+  return response.json().catch((error: unknown) => {
+    throw new Error(`${operation} returned invalid JSON`, { cause: error })
+  }) as Promise<unknown>
 }
 
-function requireSuccessfulResponse(response: Response, auth: CodexAuth, operation: string) {
+function responseError(response: Response, operation: string) {
   if (response.status === 401) {
-    if (auth.uploaded) {
-      throw new Error(
-        "Uploaded OpenCode ChatGPT authentication was rejected or expired; recreate the workspace with current credentials",
-      )
-    }
-    throw new Error("OpenCode ChatGPT authentication was rejected or expired; run `opencode auth login` and retry")
+    return "OpenCode ChatGPT authentication was rejected or expired; run `opencode auth login` and retry"
   }
   if (response.status === 403 && response.headers.get("cf-mitigated")?.toLowerCase() === "challenge") {
-    throw new Error(
-      `${operation} was blocked by a Cloudflare browser challenge; retry later or from a different network`,
-    )
+    return `${operation} was blocked by a Cloudflare browser challenge; retry later or from a different network`
   }
   if (response.status === 403) {
-    throw new Error(
-      `${operation} is forbidden for the current ChatGPT account, model, or workspace; verify that this account has Codex access`,
-    )
+    return `${operation} is forbidden for the current ChatGPT account, model, or workspace; verify that this account has Codex access`
   }
-  if (response.status === 429) throw new Error(`${operation} rate limit exceeded; retry later`)
-  if (!response.ok) throw new Error(`${operation} failed with HTTP ${response.status}`)
-}
-
-async function loadCodexModel(auth: CodexAuth, signal: AbortSignal) {
-  if (codexModel) return codexModel
-  codexModel = await discoverCodexModel(auth, signal)
-  return codexModel
+  if (response.status === 429) return `${operation} rate limit exceeded; retry later`
+  return `${operation} failed with HTTP ${response.status}`
 }
 
 async function discoverCodexModel(auth: CodexAuth, signal: AbortSignal) {
-  const response = await fetch(MODELS_ENDPOINT, { headers: authHeaders(auth), signal }).catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : "unknown network error"
-    throw new Error(`Codex model discovery request failed: ${message}`, { cause: error })
-  })
-  requireSuccessfulResponse(response, auth, "Codex model discovery")
-
-  const payload: unknown = await response.json().catch((error: unknown) => {
-    throw new Error("Codex model discovery returned invalid JSON", { cause: error })
-  })
+  const payload = await requestJson(MODELS_ENDPOINT, auth, signal, "Codex model discovery")
   if (!isRecord(payload) || !Array.isArray(payload.models)) {
     throw new Error("Codex model discovery returned an invalid response")
   }
@@ -272,15 +226,68 @@ async function discoverCodexModel(auth: CodexAuth, signal: AbortSignal) {
         typeof model.priority !== "number" ||
         !Number.isFinite(model.priority) ||
         !["list", "hide", "none"].includes(String(model.visibility))
-      ) {
-        return []
-      }
+      ) return []
       return [{ slug: model.slug, priority: model.priority, visibility: String(model.visibility) }]
     })
     .sort((left, right) => left.priority - right.priority)
   const model = candidates.find((candidate) => candidate.visibility === "list") ?? candidates[0]
   if (!model) throw new Error("Could not determine an account-eligible Codex model for web search; retry later")
   return model.slug
+}
+
+function normalizeResponse(payload: unknown, limit: number) {
+  if (
+    !isRecord(payload) ||
+    typeof payload.output !== "string" ||
+    (payload.results !== undefined && payload.results !== null && !Array.isArray(payload.results))
+  ) throw new Error("Codex web search returned an invalid response")
+
+  const results: { url: string; title: string; content?: string; time: {} }[] = []
+  let bytes = 2 // JSON array brackets; include separators in the aggregate budget.
+  for (const item of payload.results ?? []) {
+    if (!isRecord(item)) continue
+    const url = normalizeUrl(item.url)
+    if (!url) continue
+    const result = { url, title: cleanText(item.title, 300) ?? url, content: cleanText(item.snippet, 1_000), time: {} }
+    const size = Buffer.byteLength(JSON.stringify(result), "utf8") + (results.length ? 1 : 0)
+    if (bytes + size > MAX_OUTPUT_BYTES) break
+    bytes += size
+    results.push(result)
+    if (results.length >= limit) break
+  }
+  return results
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function cleanText(value: unknown, maxBytes: number): string | undefined {
+  if (typeof value !== "string") return undefined
+  const text = value.replace(/\s+/g, " ").trim()
+  if (!text) return undefined
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text
+  const segments: string[] = []
+  let size = Buffer.byteLength("...", "utf8")
+  for (const item of GRAPHEME_SEGMENTER.segment(text)) {
+    const next = Buffer.byteLength(item.segment, "utf8")
+    if (size + next > maxBytes) break
+    segments.push(item.segment)
+    size += next
+  }
+  return `${segments.join("")}...`
+}
+
+function normalizeUrl(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > 2_048) return undefined
+  try {
+    const url = new URL(value)
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined
+    const normalized = url.toString()
+    return Buffer.byteLength(normalized, "utf8") <= 2_048 ? normalized : undefined
+  } catch {
+    return undefined
+  }
 }
 
 function tokenAuthClaims(token: string) {
@@ -304,7 +311,6 @@ function tokenAuthClaims(token: string) {
 function parseJwtClaims(token: string): Record<string, unknown> | undefined {
   const payload = token.split(".")[1]
   if (!payload) return undefined
-
   try {
     const parsed: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"))
     return isRecord(parsed) ? parsed : undefined
@@ -312,126 +318,3 @@ function parseJwtClaims(token: string): Record<string, unknown> | undefined {
     return undefined
   }
 }
-
-export const CodexWebSearchPlugin: Plugin = async ({ client, directory, worktree }) => {
-  const currentPath = await canonicalPath(fileURLToPath(import.meta.url))
-  const projectConfigDisabled = ["1", "true"].includes(process.env.OPENCODE_DISABLE_PROJECT_CONFIG?.toLowerCase() ?? "")
-  const projectRoots = projectConfigDisabled
-    ? []
-    : await Promise.all(projectConfigPaths(directory, worktree).map(canonicalPath))
-  const projectPaths = await Promise.all(
-    projectRoots.flatMap((root) =>
-      ["plugin", "plugins"].map((pluginDirectory) =>
-        canonicalPath(resolve(root, pluginDirectory, "codex-web-search.ts")),
-      ),
-    ),
-  )
-  const globalPaths = await Promise.all(
-    openCodeConfigPaths().flatMap((root) =>
-      ["plugin", "plugins"].map((pluginDirectory) => canonicalPath(join(root, pluginDirectory, "codex-web-search.ts"))),
-    ),
-  )
-  const selectedProjectPath = projectPaths.find((path) => existsSync(path))
-  const selectedGlobalPath = globalPaths.findLast((path) => existsSync(path))
-  if (selectedProjectPath && selectedProjectPath !== currentPath) return {}
-  if (!selectedProjectPath && globalPaths.includes(currentPath) && selectedGlobalPath !== currentPath) return {}
-  if (registeredClients.has(client)) return {}
-  registeredClients.add(client)
-
-  return {
-    tool: {
-      codex_web_search: tool({
-        description: "Search the web",
-        args: {
-          query: tool.schema.string().trim().min(1).max(500).describe("The web search query"),
-          max_results: tool.schema
-            .number()
-            .int()
-            .min(1)
-            .max(20)
-            .optional()
-            .describe("Maximum number of structured results to return (default: 8)"),
-          recency: tool.schema
-            .number()
-            .int()
-            .min(1)
-            .max(3_650)
-            .optional()
-            .describe("Only return results from the last N days"),
-          domains: tool.schema
-            .array(tool.schema.string().trim().min(1).max(253))
-            .max(20)
-            .optional()
-            .describe("Only return results from these domains, such as github.com"),
-        },
-        async execute({ query, max_results, recency, domains }, context) {
-          const maxResults = max_results ?? DEFAULT_MAX_RESULTS
-          const searchQuery: { q: string; recency?: number; domains?: string[] } = { q: query }
-          if (recency !== undefined) searchQuery.recency = recency
-          if (domains?.length) searchQuery.domains = domains
-
-          context.metadata({ title: `Web search: ${query}` })
-          await context.ask({
-            permission: "codex_web_search",
-            patterns: [query],
-            always: ["*"],
-            metadata: { query, max_results, recency, domains, provider: "codex-standalone-search" },
-          })
-
-          const controller = new AbortController()
-          let timedOut = false
-          const cancelRequest = () => controller.abort()
-          if (context.abort.aborted) cancelRequest()
-          else context.abort.addEventListener("abort", cancelRequest, { once: true })
-          const timeout = setTimeout(() => {
-            timedOut = true
-            controller.abort()
-          }, REQUEST_TIMEOUT_MS)
-
-          try {
-            const auth = await loadCodexAuth()
-            const model = await loadCodexModel(auth, controller.signal)
-            const headers = { ...authHeaders(auth), "Content-Type": "application/json" }
-
-            const response = await fetch(SEARCH_ENDPOINT, {
-              method: "POST",
-              headers,
-              body: JSON.stringify({
-                id: `search_session_${randomUUID().replaceAll("-", "").slice(0, 16)}`,
-                model,
-                commands: { search_query: [searchQuery] },
-              }),
-              signal: controller.signal,
-            }).catch((error: unknown) => {
-              const message = error instanceof Error ? error.message : "unknown network error"
-              throw new Error(`Codex web search request failed: ${message}`, { cause: error })
-            })
-
-            requireSuccessfulResponse(response, auth, "Codex web search")
-
-            const payload: unknown = await response.json().catch((error: unknown) => {
-              throw new Error("Codex web search returned invalid JSON", { cause: error })
-            })
-            const results = normalizeResponse(payload, maxResults)
-            return {
-              title: `Web search: ${query}`,
-              output: formatResponse(query, results),
-              metadata: { query, resultCount: results.length },
-            }
-          } catch (error) {
-            if (timedOut) {
-              throw new Error(`Codex web search timed out after ${REQUEST_TIMEOUT_MS}ms`, { cause: error })
-            }
-            if (context.abort.aborted) throw new Error("Codex web search was cancelled", { cause: error })
-            throw error
-          } finally {
-            clearTimeout(timeout)
-            context.abort.removeEventListener("abort", cancelRequest)
-          }
-        },
-      }),
-    },
-  }
-}
-
-export default CodexWebSearchPlugin
